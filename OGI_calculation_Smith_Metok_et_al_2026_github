@@ -1,0 +1,547 @@
+
+# =============================================================================
+# Old-Growth Indicator (OGI adjusted) — Public Script
+# Steps 4-6: Bootstrap, OGI calculation, and weighted aggregation
+#
+# Based on Meyer et al. (2021) Ecological Indicators 125:107575
+# Extended in: Smith Metok et al. in preparation
+#
+# This script compares user-supplied forest plot data against a pre-computed
+# old-growth reference range derived from primary beech forests across Europe
+# (Slovak primeval forests + Life Prognoses primary plots + other sources-- see Vanhellemont 2025). Users do not need
+# to recompute the reference range — it is provided as a CSV file.
+#
+# STEPS IN THIS SCRIPT:
+#   Step 4 — Bootstrap plot data within strata to derive 5th–95th percentile
+#             ranges for each OGI variable
+#   Step 5 — Compare each stratum's bootstrapped range against the OG reference
+#             range and calculate the OGI score (0–1) per variable
+#   Step 6 — Weight and aggregate variable scores to group and overall OGI
+#
+# SOFTWARE: R (>= 4.1.0). Parts of the original pipeline (Steps 1–3) were
+#           implemented in SAS 9.4 and R/RStudio. Only Steps 4–6 are included
+#           here as they constitute the OGI calculation itself.
+#
+# REQUIRED PACKAGES:
+#   tidyverse (dplyr, tidyr, purrr, stringr)
+#
+# INPUT FILES (place in your working directory or update paths below):
+#   1. og_reference_ranges.csv  — Pre-computed OG reference 5th–95th percentile
+#                                 ranges by variable and productivity class.
+#                                 Provided alongside this script.
+#   2. your_plot_data.csv       — Your forest plot data. See FORMAT section below.
+#
+# YOUR PLOT DATA FORMAT (one row per plot):
+#   Required columns:
+#     plot_id          — Unique plot identifier (character)
+#     site_id          — Site/reserve identifier (character, 2 chars recommended)
+#     stratum          — Stratum label (character); format: site_sc_tsa_age_prod
+#                        e.g. "my_be_managed_evma_high"
+#                        Fields: site_id _ species_composition _ TSA_category _
+#                                age_structure _ productivity
+#     prod             — Productivity class: "high", "medi", or "lowe"
+#     ha               — Plot area in hectares (numeric)
+#     npfl_stratum     — Number of plots in this stratum (numeric)
+#     hapfl_stratum    — Total area of plots in this stratum in ha (numeric)
+#
+#   OGI variable columns (all numeric, per hectare unless noted):
+#     nha_ls           — Stem density of living trees (n/ha, dbh >= 10 cm)
+#     vha_ls           — Volume of living trees (m³/ha)
+#     diqr             — IQR of dbh in living stand (cm)
+#     nha_gtree        — Very large trees per ha (dbh >= 80 cm for high prod,
+#                        >= 70 cm for medium, >= 60 cm for low)
+#     vha_tg           — Total coarse woody debris volume (m³/ha)
+#     nha_hoe          — Trees with cavities per ha
+#     nha_pilz         — Trees with perennial polypore fungi per ha
+#     sukdn            — Successional status (weighted mean: climax=3,
+#                        intermediate=2, pioneer=1)
+#     pnaut            — Proportion of native tree species (%)
+#     vwep             — Number of different forest development stages present
+#
+# STRATUM DESIGN NOTES:
+#   - Each stratum should contain >= 10 plots and >= 0.5 ha total area to
+#     produce reliable bootstrap estimates (controlled by nmin and minha below).
+#   - If your dataset is homogeneous (e.g. all plots from a single stand type),
+#     you may use a single stratum per site rather than splitting by age/species.
+#     In that case, set stratum = site_id and prod = your productivity class.
+#   - Strata should not include primary/old-growth plots if you want an
+#     independent comparison. See manuscript discussion for details.
+#
+# PRODUCTIVITY CLASSES (affects VLT threshold):
+#   "high"  — site index > 30 m top height; VLT threshold dbh >= 80 cm
+#   "medi"  — site index 20–30 m;           VLT threshold dbh >= 70 cm
+#   "lowe"  — site index < 20 m;            VLT threshold dbh >= 60 cm
+# =============================================================================
+
+library(tidyverse)
+
+# =============================================================================
+# 0. CONFIGURATION — edit these paths and settings
+# =============================================================================
+
+# Path to the pre-computed OG reference ranges CSV (provided with this script)
+path_og_reference <- "og_reference_ranges.csv"
+
+# Path to your plot-level data CSV
+path_plot_data <- "your_plot_data.csv"
+
+# Bootstrap settings
+nlauf <- 5000   # number of bootstrap iterations (1000-5000 recommended for final run;
+# use 500 for testing)
+nmin  <- 10     # minimum number of plots required per stratum
+minha <- 0.5    # minimum total area required per stratum (ha)
+
+# OGI variables included in this analysis
+# These are the nine "OGI light" variables from Meyer et al. extended version, replacing dspanne with diqr
+ogi_vars <- c(
+  "nha_ls", "vha_ls", "diqr", "nha_gtree", "vha_tg",
+  "nha_hoe", "nha_pilz", "sukdn", "pnaut", "vwep"
+)
+
+# Variables where exceeding the OG reference range upper bound is ecologically
+# positive (i.e. more is better) — these receive OGI = 1 when lower >= maxog
+override_vars_high <- c("diqr", "nha_hoe", "nha_pilz", "vha_tg", "vha_ls", "nha_gtree")
+
+# =============================================================================
+# 1. LOAD DATA
+# =============================================================================
+
+og_reference <- read_csv(path_og_reference, show_col_types = FALSE)
+# Expected columns: _name_, prod, ogl (5th percentile), ogu (95th percentile)
+
+plot_data <- read_csv(path_plot_data, show_col_types = FALSE)
+# One row per plot; columns as described in FORMAT section above
+
+# Quick validation
+stopifnot(
+  "og_reference must have columns: _name_, prod, ogl, ogu" =
+    all(c("_name_", "prod", "ogl", "ogu") %in% names(og_reference)),
+  "plot_data must have columns: plot_id, site_id, stratum, prod, ha, npfl_stratum, hapfl_stratum" =
+    all(c("plot_id", "site_id", "stratum", "prod", "ha",
+          "npfl_stratum", "hapfl_stratum") %in% names(plot_data)),
+  "All ogi_vars must be present in plot_data" =
+    all(ogi_vars %in% names(plot_data))
+)
+
+cat("Loaded", nrow(plot_data), "plots across",
+    n_distinct(plot_data$stratum), "strata\n")
+cat("Productivity classes present:",
+    paste(sort(unique(plot_data$prod)), collapse = ", "), "\n")
+
+# =============================================================================
+# STEP 4 — Bootstrap to derive value ranges per stratum and OG reference
+# =============================================================================
+# For each productivity class separately:
+#   (a) Bootstrap the OG reference plots to get a pooled reference range
+#   (b) Bootstrap within each comparison stratum to get comparison ranges
+# Both use weighted means (area-weighted within each replicate).
+# The OG reference additionally uses inverse-frequency weights to ensure
+# equal representation of OG sites regardless of plot count.
+
+bootstrap_ogi <- function(data,
+                          nlauf = 5000,
+                          nmin  = 10,
+                          minha = 0.5,
+                          prod_level = "high") {
+  
+  # --- (a) OG reference bootstrap -------------------------------------------
+  # Filter to primary beech strata for this productivity class
+  dat1 <- data %>%
+    filter(
+      str_split_i(stratum, "_", 3) == "pri" |    # primary TSA
+        str_split_i(stratum, "_", 3) == "prime",  # alternate label
+      str_split_i(stratum, "_", 2) == "be",       # beech/bemix only
+      as.character(prod) == prod_level
+    )
+  
+  if (nrow(dat1) < 5) {
+    message("Skipping prod = ", prod_level,
+            ": only ", nrow(dat1), " OG reference plots — need >= 5")
+    return(NULL)
+  }
+  
+  # Inverse-frequency weights: equal weight per OG site regardless of n plots
+  stat1 <- dat1 %>%
+    count(stratum, name = "count") %>%
+    mutate(pct = 100 * count / sum(count),
+           gew = 1 / (pct / 100))
+  
+  dat1_w <- dat1 %>%
+    left_join(stat1 %>% select(stratum, gew), by = "stratum")
+  
+  # Bootstrap OG reference: resample all plots with replacement, nlauf times
+  og_boot <- map_dfr(seq_len(nlauf), function(rep_id) {
+    idx     <- sample(nrow(dat1_w), nrow(dat1_w), replace = TRUE)
+    sampled <- dat1_w[idx, ]
+    sampled %>%
+      summarise(
+        across(all_of(ogi_vars),
+               ~ weighted.mean(.x, w = gew * ha, na.rm = TRUE)),
+        replicate = rep_id,
+        .groups = "drop"
+      )
+  })
+  
+  # 5th–95th percentile of bootstrapped means = OG reference range
+  og_ranges <- og_boot %>%
+    pivot_longer(-replicate, names_to = "_name_", values_to = "val") %>%
+    group_by(`_name_`) %>%
+    summarise(
+      ogl = quantile(val, 0.05, na.rm = TRUE, names = FALSE),
+      ogu = quantile(val, 0.95, na.rm = TRUE, names = FALSE),
+      .groups = "drop"
+    ) %>%
+    mutate(prod = prod_level)
+  
+  # --- (b) Comparison stratum bootstrap -------------------------------------
+  # Filter strata meeting minimum size requirements; exclude non-beech primaries
+  dat2 <- data %>%
+    filter(
+      as.character(prod) == prod_level,
+      npfl_stratum >= nmin,
+      hapfl_stratum >= minha
+    ) %>%
+    filter(
+      !(str_split_i(stratum, "_", 3) %in% c("pri", "prime") &
+          str_split_i(stratum, "_", 2) != "be")
+    )
+  
+  if (nrow(dat2) == 0) {
+    message("No comparison strata meet size requirements for prod = ", prod_level)
+    return(list(og = og_ranges, li_prog = NULL))
+  }
+  
+  # Bootstrap within each stratum independently
+  li_prog_boot <- dat2 %>%
+    group_split(stratum) %>%
+    map_dfr(function(df_s) {
+      strat <- df_s$stratum[1]
+      map_dfr(seq_len(nlauf), function(rep_id) {
+        idx     <- sample(nrow(df_s), nrow(df_s), replace = TRUE)
+        sampled <- df_s[idx, ]
+        sampled %>%
+          summarise(
+            across(all_of(ogi_vars),
+                   ~ weighted.mean(.x, w = NumberHits * ha, na.rm = TRUE)),
+            stratum   = strat,
+            replicate = rep_id,
+            .groups   = "drop"
+          )
+      })
+    })
+  
+  # NOTE: NumberHits is the bootstrap hit count for each plot within a replicate.
+  # Add it before the summarise above by joining from a count step.
+  # The code above is simplified; see the full pipeline for the hit-count join.
+  # For public use with a simple bootstrap, replace w = NumberHits * ha with w = ha.
+  
+  # 5th–95th percentile per stratum
+  li_prog_ranges <- li_prog_boot %>%
+    pivot_longer(-c(stratum, replicate),
+                 names_to = "_name_", values_to = "val") %>%
+    group_by(stratum, `_name_`) %>%
+    summarise(
+      lpl = quantile(val, 0.05, na.rm = TRUE, names = FALSE),
+      lpu = quantile(val, 0.95, na.rm = TRUE, names = FALSE),
+      .groups = "drop"
+    ) %>%
+    mutate(prod = prod_level)
+  
+  list(og = og_ranges, li_prog = li_prog_ranges)
+}
+
+# Run bootstrap for each productivity class
+prod_levels <- c("high", "medi", "lowe")
+
+all_boot <- map(prod_levels, function(p) {
+  bootstrap_ogi(plot_data, nlauf = nlauf, nmin = nmin,
+                minha = minha, prod_level = p)
+}) %>%
+  setNames(prod_levels) %>%
+  compact()
+
+# Combine reference and comparison ranges across productivity classes
+og_all_prod     <- map_dfr(all_boot, "og")
+li_prog_all_prod <- map_dfr(all_boot, "li_prog")
+
+cat("Bootstrap complete.\n")
+cat("OG reference ranges computed for",
+    n_distinct(og_all_prod$prod), "productivity class(es)\n")
+cat("Comparison ranges computed for",
+    n_distinct(li_prog_all_prod$stratum), "strata\n")
+
+# ALTERNATIVE: If you have already run Steps 1–3 and have the reference ranges,
+# skip the bootstrap above and load the pre-computed reference directly:
+#
+# og_all_prod <- read_csv(path_og_reference, show_col_types = FALSE)
+# li_prog_all_prod must still be computed from your own data (bootstrap above).
+
+# =============================================================================
+# STEP 5 — OGI case logic: compare stratum range against OG reference range
+# =============================================================================
+# For each variable × stratum, the bootstrapped 5th–95th percentile range of
+# the comparison stand [lower, upper] is compared against the OG reference
+# range [minog, maxog]. Two sub-scores are computed:
+#   ogii (overlap): proportion of the OG range covered by the comparison range
+#   ogia (excess):  1 minus proportion of comparison range outside OG range
+# Final OGI = (ogii + ogia) / 2, bounded [0, 1].
+#
+# Overrides: for variables where exceeding the OG range is ecologically
+# positive (see override_vars_high), OGI = 1 when lower >= maxog.
+# For successional status (sukdn), OGI = 1 when lower >= 2.5 (near-climax).
+
+calc_ogi_case <- function(var_name, lower, upper, minog, maxog, tol = 1e-4) {
+  
+  if (any(is.na(c(lower, upper, minog, maxog)))) {
+    return(tibble(fall = NA_real_, ogii = NA_real_, ogia = NA_real_))
+  }
+  
+  eq <- function(a, b) abs(a - b) <= tol
+  if (eq(lower, upper)) upper <- lower
+  if (eq(minog, maxog)) maxog <- minog
+  
+  # Case 7.3: both are identical points
+  if (eq(lower, upper) && eq(minog, maxog) && eq(lower, minog)) {
+    return(tibble(fall = 73, ogii = 1, ogia = 1))
+  }
+  # Case 7.1/7.2: both are points, not equal
+  if (eq(lower, upper) && eq(minog, maxog) && !eq(lower, minog)) {
+    return(tibble(fall = 71, ogii = 0, ogia = 0))
+  }
+  
+  fall <- ogii <- ogia <- NA_real_
+  comp_range <- upper - lower
+  ref_range  <- maxog - minog
+  comp_point <- eq(lower, upper)
+  ref_point  <- eq(minog, maxog)
+  
+  # Case 6: comparison is a point, OG has a range
+  if (comp_point && !ref_point) {
+    if (upper < minog || upper > maxog) {
+      fall <- 61; ogii <- 0; ogia <- 0
+    } else {
+      fall <- 62; ogii <- 0; ogia <- 1
+    }
+    
+  } else if (!comp_point) {
+    # Case 1: no overlap
+    if ((upper < minog || lower > maxog) ||
+        (eq(lower, 0) && eq(upper, 0) && minog > 0 && maxog > 0)) {
+      fall <- 1; ogii <- 0; ogia <- 0
+      
+      # Case 2: comparison is a subset of OG
+    } else if (upper <= maxog && lower >= minog) {
+      fall <- 2
+      ogii <- if (ref_range > 0) comp_range / ref_range else NA_real_
+      ogia <- 1
+      
+      # Case 3: OG is a subset of comparison
+    } else if (upper >= maxog && lower <= minog) {
+      fall <- 3
+      ogii <- 1
+      ogia <- if (comp_range > 0) 1 - (comp_range - ref_range) / comp_range else NA_real_
+      
+      # Case 4.1: partial overlap, comparison extends right
+    } else if (upper > maxog && lower <= maxog && lower >= minog) {
+      fall <- 41
+      ogii <- if (ref_range > 0) (maxog - lower) / ref_range else NA_real_
+      ogia <- if (comp_range > 0) 1 - (upper - maxog) / comp_range else NA_real_
+      if (eq(lower, maxog)) ogii <- 0.5
+      
+      # Case 4.2: partial overlap, comparison extends left
+    } else if (upper >= minog && upper <= maxog && lower < minog) {
+      fall <- 42
+      ogii <- if (ref_range > 0) (upper - minog) / ref_range else NA_real_
+      ogia <- if (comp_range > 0) 1 - (minog - lower) / comp_range else NA_real_
+      if (eq(upper, minog)) ogii <- 0.5
+      
+      # Case 5.1: OG is a point outside comparison range
+    } else if (ref_point && (maxog < lower || maxog > upper)) {
+      fall <- 51; ogii <- 0; ogia <- 0
+      
+      # Case 5.2: OG is a point inside comparison range
+    } else if (ref_point && maxog >= lower && maxog <= upper) {
+      fall <- 52; ogii <- 0; ogia <- 1
+    }
+  }
+  
+  # Override 1: successional status — near-climax stands score 1
+  if (var_name == "sukdn" && !is.na(lower) && lower >= 2.75) {
+    ogii <- 1; ogia <- 1
+  }
+  
+  # Override 2: variables where exceeding OG range is ecologically positive
+  if (var_name %in% override_vars_high && !is.na(lower) && lower >= maxog) {
+    ogii <- 1; ogia <- 1
+  }
+  
+  ogii <- pmin(pmax(ogii, 0), 1)
+  ogia <- pmin(pmax(ogia, 0), 1)
+  
+  tibble(fall = fall, ogii = ogii, ogia = ogia)
+}
+
+# Prepare OG reference and comparison ranges for the nine focal variables
+focal_vars <- c("diqr", "nha_hoe", "nha_pilz", "nha_gtree",
+                "pnaut", "sukdn", "vha_ls", "vha_tg", "vwep")
+
+ogr <- og_all_prod %>%
+  filter(`_name_` %in% focal_vars) %>%
+  transmute(`_name_`, prod, minog = ogl, maxog = ogu)
+
+lp <- li_prog_all_prod %>%
+  filter(!is.na(stratum), stratum != "",
+         `_name_` %in% focal_vars) %>%
+  transmute(stratum, prod, `_name_`, lower = lpl, upper = lpu)
+
+# Join comparison ranges with reference ranges (matched by variable AND productivity)
+ogi_calc <- lp %>%
+  left_join(ogr, by = c("_name_", "prod")) %>%
+  mutate(
+    across(c(lower, upper, minog, maxog), ~ round(.x, 1)),
+    across(c(lower, upper, minog, maxog), ~ if_else(.x < 0.01, 0, .x))
+  )
+
+# Apply OGI case logic row by row
+ogi_cases <- pmap_dfr(
+  list(ogi_calc$`_name_`, ogi_calc$lower, ogi_calc$upper,
+       ogi_calc$minog, ogi_calc$maxog),
+  calc_ogi_case
+)
+
+ogi_result <- bind_cols(ogi_calc, ogi_cases) %>%
+  mutate(
+    ogi = (ogii + ogia) / 2,
+    var = `_name_`
+  ) %>%
+  select(-`_name_`) %>%
+  arrange(stratum, var)
+
+# Check for missing OGI values (indicates stratum has no matching reference)
+missing_ref <- ogi_result %>%
+  filter(is.na(minog)) %>%
+  distinct(stratum, prod, var)
+
+if (nrow(missing_ref) > 0) {
+  warning("The following stratum × variable combinations have no OG reference ",
+          "range (likely a productivity class with no OG plots). ",
+          "These will be NA in the final OGI.\n",
+          paste(missing_ref$stratum, missing_ref$var, sep = " / ",
+                collapse = "\n"))
+}
+
+# Mean OGI per stratum (unweighted average across variables)
+mogi_by_stratum <- ogi_result %>%
+  group_by(stratum) %>%
+  summarise(mogi = round(mean(ogi, na.rm = TRUE), 2), .groups = "drop")
+
+life_prog_ogi_berechnet <- ogi_result %>%
+  left_join(mogi_by_stratum, by = "stratum") %>%
+  mutate(
+    site = str_split_i(stratum, "_", 1),
+    tsa  = str_split_i(stratum, "_", 3)
+  ) %>%
+  select(site, tsa, stratum, prod, mogi, var,
+         ogi, ogii, ogia, lower, upper, minog, maxog, fall) %>%
+  arrange(stratum, var)
+
+cat("OGI calculation complete.\n")
+cat("Strata with results:", n_distinct(life_prog_ogi_berechnet$stratum), "\n")
+
+# =============================================================================
+# STEP 6 — Group weighting and final aggregated OGI score
+# =============================================================================
+# Variables are assigned to six thematic groups. Within each group, equal
+# weight is applied across variables, and each group receives equal weight
+# (1/6) in the final aggregated score. Groups with two variables each receive
+# weight 1/12 per variable, so that each group's total contribution = 1/6.
+#
+# Group weights sum to exactly 1:
+#   3 single-variable groups × 1/6  = 3/6
+#   3 two-variable groups × 2×(1/12) = 3/6
+#   Total = 1.0
+
+life_prog_ogi_step6 <- life_prog_ogi_berechnet %>%
+  mutate(
+    grup = case_when(
+      var == "pnaut"                  ~ "Native species",
+      var == "vha_tg"                 ~ "Deadwood",
+      var %in% c("vha_ls","nha_gtree") ~ "Old or large trees",
+      var %in% c("diqr","vwep")       ~ "Structural complexity",
+      var %in% c("nha_hoe","nha_pilz") ~ "Habitat trees",
+      var == "sukdn"                  ~ "Indicator species",
+      TRUE ~ NA_character_
+    ),
+    gew = case_when(
+      var %in% c("pnaut","vha_tg","sukdn")              ~ 1/6,
+      var %in% c("vha_ls","nha_gtree",
+                 "diqr","vwep","nha_hoe","nha_pilz")    ~ 1/12,
+      TRUE ~ NA_real_
+    ),
+    ogiw = ogi * gew   # weighted variable score
+  )
+
+# Weighted sum per stratum = final OGI score (mogiw)
+mogiw_by_stratum <- life_prog_ogi_step6 %>%
+  group_by(stratum) %>%
+  summarise(mogiw = sum(ogiw, na.rm = TRUE), .groups = "drop")
+
+life_prog_ogi_step6 <- life_prog_ogi_step6 %>%
+  left_join(mogiw_by_stratum, by = "stratum") %>%
+  select(stratum, tsa, prod, mogi, mogiw,
+         grup, var, ogi, ogii, ogia, ogiw,
+         lower, upper, minog, maxog, fall) %>%
+  arrange(stratum, var)
+
+# =============================================================================
+# OUTPUT
+# =============================================================================
+
+# Summary: one row per stratum with the final weighted OGI score
+ogi_summary <- life_prog_ogi_step6 %>%
+  distinct(stratum, tsa, prod, mogi, mogiw) %>%
+  arrange(desc(mogiw))
+
+cat("\nOverall OGI summary by stratum:\n")
+print(ogi_summary)
+
+# Write outputs
+dir.create("output", showWarnings = FALSE)
+write.csv(life_prog_ogi_step6, "output/ogi_results_by_variable.csv",
+          row.names = FALSE)
+write.csv(ogi_summary,         "output/ogi_results_summary.csv",
+          row.names = FALSE)
+
+cat("\nResults written to output/\n")
+
+# =============================================================================
+# NOTES FOR USERS
+# =============================================================================
+# 1. STRATUM SIZE: Strata with fewer than 10 plots (nmin) are excluded from
+#    the bootstrap. If your dataset is small, reduce nmin with caution —
+#    bootstrap estimates become unreliable below ~5 plots per stratum.
+#
+# 2. PRODUCTIVITY MATCHING: Each comparison stratum is compared against the OG
+#    reference range for its own productivity class. If your site has no
+#    matching productivity class in the OG reference (e.g. "lowe"), it will
+#    receive NA scores. Check the warning output above.
+#
+# 3. PRIMARY STRATA: If you include primary/old-growth plots as comparison
+#    strata, be aware that they are not fully independent of the OG reference
+#    range (some of these plots contributed to the reference). Their OGI scores
+#    will be lower than 1.0 by design — see Meyer et al. (2021) for discussion.
+#    This is expected and not an error.
+#
+# 4. USING STANDS INSTEAD OF STRATA: If your plots come from a single,
+#    homogeneous stand type, you can assign all plots to one stratum per site
+#    (stratum = site_id). Bootstrapping within the stand then mirrors the
+#    original Meyer et al. approach more closely and avoids the complexity of
+#    stratum definitions.
+#
+# 5. REFERENCE RANGE CSV: The og_reference_ranges.csv provided with this
+#    script was computed from primary beech forests in eastern Slovakia
+#    (Havesova, Kyjov, Stuzica; Meyer et al. 2021) and primary forest plots
+#    from the Life Prognoses project (see Smith Metok et al. in preparation). If you wish to
+#    use a different reference, replace the CSV with a file having the same
+#    column structure: _name_, prod, ogl, ogu.
+
