@@ -86,7 +86,7 @@ path_og_reference <- "og_reference_ranges.csv"
 path_plot_data <- "your_plot_data.csv"
 
 # Bootstrap settings
-nlauf <- 5000   # number of bootstrap iterations (1000-5000 recommended for final run;
+nlauf <- 500   # number of bootstrap iterations (1000-5000 recommended for final run;
 # use 500 for testing)
 nmin  <- 10     # minimum number of plots required per stratum
 minha <- 0.5    # minimum total area required per stratum (ha)
@@ -213,26 +213,32 @@ bootstrap_ogi <- function(data,
   
   # Bootstrap within each stratum independently
   li_prog_boot <- dat2 %>%
-    group_split(stratum) %>%
-    map_dfr(function(df_s) {
-      strat <- df_s$stratum[1]
-      map_dfr(seq_len(nlauf), function(rep_id) {
-        idx     <- sample(nrow(df_s), nrow(df_s), replace = TRUE)
-        sampled <- df_s[idx, ]
-        sampled %>%
-          summarise(
-            across(all_of(ogi_vars),
-                   ~ weighted.mean(.x, w = NumberHits * ha, na.rm = TRUE)),
-            stratum   = strat,
-            replicate = rep_id,
-            .groups   = "drop"
-          )
-      })
+  group_split(stratum) %>%
+  map_dfr(function(df_s) {
+    strat <- df_s$stratum[1]
+    
+    # Compute NumberHits once on original data
+    hit_weights <- df_s %>%
+      count(site_id, stratum, plot_id, name = "NumberHits")
+    
+    df_s <- df_s %>%
+      left_join(hit_weights, by = c("site_id", "stratum", "plot_id"))
+    
+    map_dfr(seq_len(nlauf), function(rep_id) {
+      idx     <- sample(nrow(df_s), nrow(df_s), replace = TRUE)
+      sampled <- df_s[idx, ]
+      sampled %>%
+        summarise(
+          across(all_of(ogi_vars),
+                 ~ weighted.mean(.x, w = NumberHits * ha, na.rm = TRUE)),
+          stratum   = strat,
+          replicate = rep_id,
+          .groups   = "drop"
+        )
     })
+  })
   
   # NOTE: NumberHits is the bootstrap hit count for each plot within a replicate.
-  # Add it before the summarise above by joining from a count step.
-  # The code above is simplified; see the full pipeline for the hit-count join.
   # For public use with a simple bootstrap, replace w = NumberHits * ha with w = ha.
   
   # 5th–95th percentile per stratum
