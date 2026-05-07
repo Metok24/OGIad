@@ -15,7 +15,7 @@ The OGI adjusted method is based on Meyer et al. (2021, *Ecological Indicators* 
 
 | File | Description |
 |------|-------------|
-| `og_reference_ranges.csv` | Pre-computed OG reference ranges (5th–95th percentile) by variable and productivity class, derived from the Slovak primary forests and Life Prognoses primary plots. Used as input to the public-use script. |
+| `og_reference_ranges.csv` | Pre-computed OG reference ranges (5th–95th percentile) by variable and productivity class, derived from the UNESCO WH primary beech forests. Used as input to the public-use script. |
 
 ---
 
