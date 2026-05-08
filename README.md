@@ -35,7 +35,7 @@ If you want to calculate the OGI adjusted for your own forest plots, you only ne
 
 The script includes input validation, informative warnings, and notes explaining each step. See the **NOTES FOR USERS** section at the bottom of the script for guidance on stratum design, productivity classes, and small datasets.
 
-> **Note on the reference range:** The `og_reference_ranges.csv` provided here was derived from primary beech forests (Havesova, Kyjov, Stuzica, and Life Prognoses primary plots). If your forests differ substantially in species composition or biogeographic region, consider whether this reference is appropriate for your application — see the manuscript discussion.
+> **Note on the reference range:** The `og_reference_ranges.csv` provided here was derived from primary beech forests (Havesova, Kyjov, Stuzica, Life Prognoses primary plots, and other data sources; see Vanhellemont 2025). If your forests differ substantially in species composition or biogeographic region, consider whether this reference is appropriate for your application — see the manuscript discussion.
 
 ---
 
